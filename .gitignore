@@ -1,0 +1,11 @@
+.zip
+*zip
+zip/
+.env
+*env
+env/
+/datasets
+competition_package/datasets
+venv/
+*venv
+.venv
