@@ -1,9 +1,11 @@
 import os
 import sys
+import json
+from collections import deque
+
 import numpy as np
 import torch
 import torch.nn as nn
-import json
 
 # Add project root folder to path for importing utils
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -14,37 +16,78 @@ from utils import DataPoint
 
 class MultiFeatureLSTM(nn.Module):
     """
-    LSTM model for predicting all features simultaneously.
-    Input: [batch, lookback, num_features]
-    Output: [batch, num_features]
+    LSTM model for predicting raw features from engineered inputs.
+    Input: [batch, lookback, input_features]
+    Output: [batch, output_features]
     """
-    def __init__(self, input_size, hidden_size, num_layers, dropout=0.2):
+
+    def __init__(self, input_size, output_size, hidden_size, num_layers, dropout=0.2):
         super().__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
+            dropout=dropout if num_layers > 1 else 0,
         )
-        # Output layer: maps hidden state to all features
-        self.linear = nn.Linear(hidden_size, input_size)
-        
+        self.linear = nn.Linear(hidden_size, output_size)
+
     def forward(self, x):
-        # x: [batch, lookback, input_size]
-        # Pass through LSTM
         lstm_out, _ = self.lstm(x)
-        # Take the output from the last timestep
-        # lstm_out: [batch, lookback, hidden_size]
-        # We want: [batch, hidden_size]
         last_hidden = lstm_out[:, -1, :]
-        # Map to output features
-        output = self.linear(last_hidden)  # [batch, input_size]
-        return output
+        return self.linear(last_hidden)
+
+
+class RollingFeatureBuffer:
+    """
+    Maintains per-sequence history and builds rolling feature vectors on the fly.
+    """
+
+    SUPPORTED_STATS = ("mean", "std")
+
+    def __init__(self, base_dim, lookback, windows, stats):
+        self.base_dim = base_dim
+        self.lookback = lookback
+        self.windows = sorted(windows) if windows else []
+        self.stats = [stat for stat in stats if stat in self.SUPPORTED_STATS]
+        self.max_window = max(self.windows, default=1)
+        max_history = max(self.lookback, self.max_window)
+        self.raw_history: deque[np.ndarray] = deque(maxlen=max_history)
+        self.feature_history: deque[np.ndarray] = deque(maxlen=self.lookback)
+        self.feature_size = self._compute_feature_size()
+
+    def _compute_feature_size(self) -> int:
+        extra_multiplier = len(self.windows) * len(self.stats)
+        return self.base_dim * (1 + extra_multiplier)
+
+    def reset(self) -> None:
+        self.raw_history.clear()
+        self.feature_history.clear()
+
+    def append(self, state: np.ndarray) -> np.ndarray:
+        state_vec = np.asarray(state, dtype=np.float32)
+        self.raw_history.append(state_vec)
+        history_list = list(self.raw_history)
+        parts = [state_vec]
+
+        for window in self.windows:
+            recent = history_list[-window:]
+            stacked = np.stack(recent, axis=0)
+            if "mean" in self.stats:
+                parts.append(stacked.mean(axis=0))
+            if "std" in self.stats:
+                parts.append(stacked.std(axis=0, ddof=0))
+
+        feature_vec = np.concatenate(parts).astype(np.float32)
+        self.feature_history.append(feature_vec)
+        return feature_vec
+
+    def has_enough_history(self) -> bool:
+        return len(self.feature_history) >= self.lookback
+
+    def get_window(self) -> np.ndarray:
+        window = list(self.feature_history)[-self.lookback :]
+        return np.stack(window, axis=0).astype(np.float32)
 
 
 class PredictionModel:
@@ -54,48 +97,33 @@ class PredictionModel:
     """
     
     def __init__(self):
-        # Model hyperparameters (from training)
-        self.lookback = 7
-        self.num_features = 32
-        self.hidden_size = 128
-        self.num_layers = 2
-        self.dropout = 0.2
-        
-        # Initialize model
+        self.config = self._load_config()
+        self.lookback = self.config.get("lookback", 7)
+        self.hidden_size = self.config.get("hidden_size", 128)
+        self.num_layers = self.config.get("num_layers", 2)
+        self.dropout = self.config.get("dropout", 0.2)
+        self.rolling_windows = self.config.get("rolling_windows", [5, 15, 30])
+        self.feature_stats = self.config.get("feature_stats", ["mean", "std"])
+        self.base_num_features = self.config.get("base_num_features", 32)
+        self.feature_buffer = RollingFeatureBuffer(
+            base_dim=self.base_num_features,
+            lookback=self.lookback,
+            windows=self.rolling_windows,
+            stats=self.feature_stats,
+        )
+        self.input_feature_size = self.config.get("input_feature_size", self.feature_buffer.feature_size)
+        self.output_feature_size = self.config.get("output_feature_size", self.base_num_features)
+
         self.model = MultiFeatureLSTM(
-            input_size=self.num_features,
+            input_size=self.input_feature_size,
+            output_size=self.output_feature_size,
             hidden_size=self.hidden_size,
             num_layers=self.num_layers,
-            dropout=self.dropout
+            dropout=self.dropout,
         )
-        
-        # Load model weights
-        # Try multiple possible paths for model file
-        possible_paths = [
-            os.path.join(CURRENT_DIR, "model", "lstm_model.pt"),
-            os.path.join(CURRENT_DIR, "lstm_model.pt"),
-            "model/lstm_model.pt",
-            "lstm_model.pt"
-        ]
-        
-        model_path = None
-        for path in possible_paths:
-            if os.path.exists(path):
-                model_path = path
-                break
-        
-        if model_path:
-            # Load state dict
-            self.model.load_state_dict(torch.load(model_path, map_location='cpu'))
-            self.model.eval()  # Set to evaluation mode
-        else:
-            # If model file doesn't exist, use untrained model (for testing)
-            print(f"Warning: Model file not found. Tried: {possible_paths}")
-            print("Using untrained model. Make sure to include model/lstm_model.pt in your submission.")
-        
-        # Track current sequence and history
+        self._load_weights()
+
         self.current_seq_ix = None
-        self.sequence_history = []
         
     def predict(self, data_point: DataPoint) -> np.ndarray | None:
         """
@@ -107,39 +135,71 @@ class PredictionModel:
         Returns:
             numpy array of predictions if need_prediction is True, None otherwise
         """
-        # Check if we've moved to a new sequence
         if self.current_seq_ix != data_point.seq_ix:
-            # Reset state for new sequence
             self.current_seq_ix = data_point.seq_ix
-            self.sequence_history = []
-        
-        # Add current state to history
-        self.sequence_history.append(data_point.state.copy())
+            self.feature_buffer.reset()
+        if data_point.state.shape[0] != self.base_num_features:
+            self.base_num_features = data_point.state.shape[0]
+            self.feature_buffer = RollingFeatureBuffer(
+                base_dim=self.base_num_features,
+                lookback=self.lookback,
+                windows=self.rolling_windows,
+                stats=self.feature_stats,
+            )
+
+        self.feature_buffer.append(data_point.state.copy())
         
         # If prediction is not needed, return None
         if not data_point.need_prediction:
             return None
         
-        # Need at least 'lookback' steps to make a prediction
-        if len(self.sequence_history) < self.lookback:
-            # If we don't have enough history, use the current state as prediction
-            # This should only happen in early steps of a sequence
+        if not self.feature_buffer.has_enough_history():
             return data_point.state.copy()
-        
-        # Get the last 'lookback' states for prediction
-        window = self.sequence_history[-self.lookback:]
-        
-        # Convert to tensor format: [batch=1, lookback, features]
-        window_array = np.array(window, dtype=np.float32)
-        window_tensor = torch.tensor(window_array, dtype=torch.float32).unsqueeze(0)
+
+        window_tensor = torch.tensor(
+            self.feature_buffer.get_window(), dtype=torch.float32
+        ).unsqueeze(0)
         
         # Make prediction
         with torch.no_grad():
             prediction = self.model(window_tensor)
-            # Convert back to numpy array
             prediction_np = prediction.squeeze(0).cpu().numpy()
-        
         return prediction_np
+
+    def _load_config(self) -> dict:
+        possible_paths = [
+            os.path.join(CURRENT_DIR, "model", "model_config.json"),
+            os.path.join(CURRENT_DIR, "model_config.json"),
+            "model/model_config.json",
+            "model_config.json",
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        return {}
+
+    def _load_weights(self) -> None:
+        requested_path = self.config.get("model_path", "model/lstm_with_features.pt")
+        possible_paths = [
+            os.path.join(CURRENT_DIR, requested_path),
+            os.path.join(CURRENT_DIR, "model", "lstm_with_features.pt"),
+            os.path.join(CURRENT_DIR, "lstm_with_features.pt"),
+            requested_path,
+        ]
+        model_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                model_path = path
+                break
+
+        if model_path:
+            state = torch.load(model_path, map_location="cpu")
+            self.model.load_state_dict(state)
+            self.model.eval()
+        else:
+            print(f"Warning: Model file not found. Tried: {possible_paths}")
+            print("Using randomly initialized weights; include model artifacts in submission.")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,16 @@
+{
+  "lookback": 16,
+  "hidden_size": 256,
+  "num_layers": 3,
+  "dropout": 0.3,
+  "learning_rate": 0.001,
+  "batch_size": 64,
+  "num_epochs": 25,
+  "rolling_windows": [5, 15, 30],
+  "feature_stats": ["mean", "std"],
+  "base_num_features": 32,
+  "input_feature_size": 224,
+  "output_feature_size": 32,
+  "model_path": "model/lstm_with_features.pt"
+}
+
